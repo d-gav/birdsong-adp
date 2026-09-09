@@ -1,10 +1,19 @@
 /*
- * Simple ADC/Protothreads demo integrated with Keypad
+ * ADC/Protothreads Demo with Keypad Record & Playback
  *
- * Scans a 3x4 matrix keypad with debouncing.
- * When key '0' is pressed and held, plays a sine wave tone via DAC (SPI).
- * Sine wave frequency is dynamically updated via ADC input on GPIO 26
- * (defaulting to 440 Hz if ADC is 0V/unconnected).
+ * Requirements:
+ * - Boots in "Play Mode" (default).
+ * - Pressing/releasing key '0' toggles the live potentiometer tone generator ON/OFF.
+ * - Pressing/releasing the asterisk '*' button toggles "Record Mode".
+ * - In "Record Mode", pushing and holding any key 1-9 records the frequency of the
+ *   potentiometer at 100 Hz for as long as that button is held. Sound is played live.
+ * - Releasing the button stops recording and saves the frequency sequence (up to 10 seconds).
+ * - Pressing/releasing the asterisk '*' button returns to "Play Mode".
+ * - In "Play Mode", pressing/releasing that key plays back the recorded frequency sequence at 100 Hz.
+ * - Storing frequencies (uint16_t in Hz), not raw waveforms, at 100 Hz.
+ * - Only 2 protothreads on Core 0:
+ *     1) protothread_keypad: Keypad scanning, debouncing, mode toggling, button events.
+ *     2) protothread_adc: 100 Hz audio control engine (ADC sampling, recording, and playback).
  */
 
 #include "hardware/gpio.h"
@@ -20,11 +29,11 @@
 #include <math.h>
 
 // ==========================================
-// === protothreads globals
+// === Protothreads headers & definitions
 // ==========================================
 #include "pt_cornell_rp2040_v1_4.h"
 
-// Pin definitions
+// Pin configurations
 #define LED_PIN         25
 #define ADC_PIN         26
 #define ADC_MUX         0
@@ -42,8 +51,6 @@
 volatile unsigned int phase_accum_main = 0;
 volatile unsigned int phase_incr_main = 0;
 volatile bool play_tone = false;
-volatile unsigned int current_adc_val = 0;
-volatile unsigned int current_freq = 440;
 
 // SPI data and DAC configurations (MCP4822 / MCP4802)
 uint16_t DAC_data;
@@ -57,7 +64,7 @@ uint16_t DAC_data;
 #define PIN_MOSI        7
 #define SPI_PORT        spi0
 
-// GPIO for timing the ISR
+// GPIO for timing the ISR (measured with oscilloscope)
 #define ISR_GPIO        2
 
 // DDS sine table
@@ -65,16 +72,49 @@ uint16_t DAC_data;
 volatile int sin_table[sine_table_size];
 
 // ==================================================
+// === Recording & Playback Parameters (100 Hz)
+// ==================================================
+#define RECORD_SECONDS      10
+#define RECORD_RATE_HZ      100
+#define MAX_RECORD_SAMPLES  (RECORD_SECONDS * RECORD_RATE_HZ) // 1,000 samples = 10 seconds
+#define NUM_RECORD_KEYS     10                                // Keys 0..9 (1..9 used for sounds)
+
+typedef enum {
+    MODE_PLAY = 0,
+    MODE_RECORD
+} system_mode_t;
+
+typedef struct {
+    uint16_t freq[MAX_RECORD_SAMPLES]; // Frequency stored in Hz (100 Hz sampling rate)
+    uint16_t count;                    // Number of recorded samples
+} sound_recording_t;
+
+// Frequency recordings for keys 1 through 9
+sound_recording_t recordings[NUM_RECORD_KEYS];
+
+// System mode and state flags
+volatile system_mode_t current_mode = MODE_PLAY;
+volatile bool live_tone_on = false;       // Toggled by key '0'
+
+volatile bool is_recording = false;       // Active while holding a key 1-9 in Record Mode
+volatile int  recording_key = -1;
+
+volatile bool is_playing = false;         // Active while playing back a recorded sequence
+volatile int  playback_key = -1;
+volatile uint16_t playback_idx = 0;
+
+// ==================================================
 // === Keypad Configuration
 // ==================================================
-// Keypad connections:
-// GPIO 9-12: Rows 1-4 (outputs)
-// GPIO 13-15: Cols 1-3 (inputs with pull-ups)
 #define BASE_KEYPAD_PIN 9
 #define KEYROWS         4
 #define NUMKEYS         12
 
-// Keycodes mapped to key values (index 0 is key '0', 1-9 are '1'-'9', 10 is '*', 11 is '#')
+// Keycodes mapped to key values:
+// Index 0: '0'
+// Indices 1..9: '1'..'9'
+// Index 10: '*'
+// Index 11: '#'
 const unsigned int keycodes[NUMKEYS] = {
     0x57, // '0' (Row 4, Col 2)
     0x6E, // '1' (Row 1, Col 1)
@@ -91,7 +131,7 @@ const unsigned int keycodes[NUMKEYS] = {
 };
 
 const unsigned int scancodes[KEYROWS] = { 0xE, 0xD, 0xB, 0x7 };
-const unsigned int button_mask = 0x70; // Column bits mask (pins 13, 14, 15)
+const unsigned int button_mask = 0x70; // Columns mask (pins 13, 14, 15)
 
 // Debouncing state machine states
 enum debounce_state {
@@ -109,64 +149,33 @@ static int scan_keypad(void) {
     for (row = 0; row < KEYROWS; row++) {
         // Set one row low, others high
         gpio_put_masked((0xF << BASE_KEYPAD_PIN), (scancodes[row] << BASE_KEYPAD_PIN));
-        // Small delay for line capacitance to settle
         sleep_us(1);
-        // Read the 7 keypad pins (bits 0-3 rows, bits 4-6 columns)
         keypad_state = ((gpio_get_all() >> BASE_KEYPAD_PIN) & 0x7F);
 
-        // Break if any column is pulled low in this row
         if ((~keypad_state) & button_mask) {
             break;
         }
     }
 
-    // Reset all rows back to high
+    // Reset all rows high
     gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0xF << BASE_KEYPAD_PIN));
 
-    // If a button press was detected on any column
     if ((~keypad_state) & button_mask) {
         for (key_idx = 0; key_idx < NUMKEYS; key_idx++) {
             if (keypad_state == keycodes[key_idx]) {
                 return key_idx;
             }
         }
-        return -1; // Multiple keys / invalid code
+        return -1; // Invalid keycode
     }
 
-    return -1; // No button pressed
+    return -1; // No key pressed
 }
 
 // ==================================================
-// === ADC Protothread
+// === Thread 1: Keypad Protothread
 // ==================================================
-static PT_THREAD (protothread_adc(struct pt *pt))
-{
-    PT_BEGIN(pt);
-
-    static unsigned int adc_val;
-
-    while(1) {
-        // Toggle onboard LED as system heartbeat
-        gpio_put(LED_PIN, !gpio_get(LED_PIN));
-
-        // Read the ADC
-        adc_val = adc_read();
-        current_adc_val = adc_val;
-
-        // Determine frequency: use ADC reading or default to 440 Hz if 0
-        current_freq = (adc_val > 0) ? adc_val : 440;
-        phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
-
-        // Periodic yield (100 ms)
-        PT_YIELD_usec(100000);
-    }
-
-    PT_END(pt);
-}
-
-// ==================================================
-// === Keypad Protothread (with debouncing)
-// ==================================================
+// Handles debouncing, button press/release events, mode toggling
 static PT_THREAD (protothread_keypad(struct pt *pt))
 {
     PT_BEGIN(pt);
@@ -189,47 +198,105 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
             case STATE_MAYBE_PRESSED:
                 if (scanned_key == possible) {
                     state = STATE_PRESSED;
-                    // Confirmed key press
-                    if (possible == 0) {
-                        play_tone = true;
-                    } 
+                    // --- BUTTON PRESS EVENT CONFIRMED ---
 
+                    if (current_mode == MODE_RECORD) {
+                        // In Record Mode: pushing and holding a key 1-9 starts recording
+                        if (possible >= 1 && possible <= 9) {
+                            recording_key = possible;
+                            recordings[recording_key].count = 0;
+                            is_recording = true;
+                            printf("[RECORD] Key %d recording started (hold down to record, release to finish)...\n", recording_key);
+                        }
+                    } else {
+                        // In Play Mode
+                        if (possible >= 1 && possible <= 9) {
+                            // Pressing key 1-9 triggers playback of stored frequency sequence
+                            if (recordings[possible].count > 0) {
+                                playback_key = possible;
+                                playback_idx = 0;
+                                is_playing = true;
+                                printf("[PLAY] Playing Key %d (%d samples, %.2f s)...\n",
+                                       playback_key, recordings[playback_key].count,
+                                       (float)recordings[playback_key].count / (float)RECORD_RATE_HZ);
+                            } else {
+                                printf("[PLAY] Key %d is empty! (Press '*' to enter Record Mode)\n", possible);
+                            }
+                        } else if (possible == 0) {
+                            // Pressing '0' toggles live potentiometer tone generator ON/OFF
+                            live_tone_on = !live_tone_on;
+                            if (!live_tone_on && !is_playing && !is_recording) {
+                                play_tone = false;
+                            }
+                            printf("[LIVE] Live tone generator %s\n", live_tone_on ? "ON" : "OFF");
+                        }
+                    }
                 } else {
                     state = STATE_NOT_PRESSED;
                 }
-
                 break;
 
             case STATE_PRESSED:
-                if (scanned_key == possible) {
-                    // Key is continuously held down
-                    if (possible == 0) {
-                        play_tone = true;
-                    }
-                } else {
+                if (scanned_key != possible) {
                     state = STATE_MAYBE_NOT_PRESSED;
                 }
                 break;
 
             case STATE_MAYBE_NOT_PRESSED:
                 if (scanned_key == possible) {
-                    // Bounced back to pressed
+                    // Glitch, back to pressed
                     state = STATE_PRESSED;
-                    if (possible == 0) {
-                        play_tone = true;
-                    }
                 } else {
                     state = STATE_NOT_PRESSED;
-                    // Confirmed key release
-                    if (possible == 0) {
-                        play_tone = false;
+                    // --- BUTTON RELEASE EVENT CONFIRMED ---
+                    int released_key = possible;
+
+                    // Asterisk key ('*', index 10): Toggle Record / Play Mode
+                    if (released_key == 10) {
+                        // Stop any ongoing recording or playback when switching modes
+                        if (is_recording && recording_key >= 1 && recording_key <= 9) {
+                            is_recording = false;
+                            printf("[RECORD] Key %d recording ended due to mode switch (%d samples).\n",
+                                   recording_key, recordings[recording_key].count);
+                            recording_key = -1;
+                        }
+                        is_playing = false;
+                        if (!live_tone_on) {
+                            play_tone = false;
+                        }
+
+                        // Toggle mode
+                        current_mode = (current_mode == MODE_PLAY) ? MODE_RECORD : MODE_PLAY;
+                        printf("\n========================================\n");
+                        if (current_mode == MODE_RECORD) {
+                            printf(">>> MODE: RECORD MODE <<<\n");
+                            printf("Push & hold any key 1-9 to record slide pot frequencies.\n");
+                            printf("Press '*' again to return to Play Mode.\n");
+                        } else {
+                            printf(">>> MODE: PLAY MODE <<<\n");
+                            printf("Press any key 1-9 to play back recorded sounds.\n");
+                            printf("Press '0' to toggle live tone.\n");
+                        }
+                        printf("========================================\n\n");
                     }
+                    // Releasing a key 1-9 in Record Mode stops recording
+                    else if (current_mode == MODE_RECORD && is_recording && released_key == recording_key) {
+                        is_recording = false;
+                        if (!live_tone_on) {
+                            play_tone = false;
+                        }
+                        printf("[RECORD] Key %d saved: %d samples (%.2f seconds).\n",
+                               recording_key, recordings[recording_key].count,
+                               (float)recordings[recording_key].count / (float)RECORD_RATE_HZ);
+                        recording_key = -1;
+                    }
+
                     possible = -1;
                 }
                 break;
         }
 
-        // Scan every 30 ms
+        // Debounce scan cadence: 30 ms
         PT_YIELD_usec(30000);
     }
 
@@ -237,16 +304,101 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
 }
 
 // ==================================================
-// === Alarm ISR (DDS Sample Output to DAC)
+// === Thread 2: ADC & Audio Control Protothread (100 Hz)
+// ==================================================
+// Runs at exactly 100 Hz (10 ms period).
+// Responsible for:
+//   1. Sampling ADC and storing frequencies into memory when recording
+//   2. Stepping through recorded frequencies when playing back
+//   3. Live tone potentiometer frequency tracking when live tone is enabled
+static PT_THREAD (protothread_adc(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    static unsigned int adc_val;
+    static uint16_t current_freq;
+    static int tick_counter = 0;
+
+    while(1) {
+        // --- 1. RECORDING AT 100 Hz ---
+        if (is_recording && recording_key >= 1 && recording_key <= 9) {
+            adc_val = adc_read();
+            // Scale 12-bit ADC (0-4095) to 0-10,000 Hz range
+            current_freq = (uint16_t)((adc_val * 10000UL) / 4095UL);
+            if (current_freq < 100) current_freq = 100; // Minimum audible threshold
+
+            // Store frequency into key buffer if space remains
+            if (recordings[recording_key].count < MAX_RECORD_SAMPLES) {
+                recordings[recording_key].freq[recordings[recording_key].count++] = current_freq;
+            } else {
+                // Buffer full warning (10 seconds reached)
+                static bool warned = false;
+                if (!warned) {
+                    printf("[RECORD] Key %d buffer full (max %d seconds reached)!\n", recording_key, RECORD_SECONDS);
+                    warned = true;
+                }
+            }
+
+            // Output sound live so user hears what they are recording
+            phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
+            play_tone = true;
+        }
+
+        // --- 2. PLAYBACK AT 100 Hz ---
+        else if (is_playing && playback_key >= 1 && playback_key <= 9) {
+            if (playback_idx < recordings[playback_key].count) {
+                current_freq = recordings[playback_key].freq[playback_idx++];
+                phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
+                play_tone = true;
+            } else {
+                // Playback finished
+                is_playing = false;
+                if (!live_tone_on) {
+                    play_tone = false;
+                }
+                printf("[PLAY] Key %d playback complete.\n", playback_key);
+                playback_key = -1;
+            }
+        }
+
+        // --- 3. LIVE TONE GENERATOR (Key 0 toggle) ---
+        else if (live_tone_on) {
+            adc_val = adc_read();
+            current_freq = (uint16_t)((adc_val * 10000UL) / 4095UL);
+            if (current_freq < 100) current_freq = 100;
+            phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
+            play_tone = true;
+        }
+
+        // --- 4. IDLE / SILENCE ---
+        else {
+            play_tone = false;
+        }
+
+        // Heartbeat LED toggle every 500 ms (50 ticks @ 10 ms)
+        if (++tick_counter >= 50) {
+            tick_counter = 0;
+            gpio_put(LED_PIN, !gpio_get(LED_PIN));
+        }
+
+        // Yield for 10 ms -> Exactly 100 Hz sample rate
+        PT_YIELD_usec(10000);
+    }
+
+    PT_END(pt);
+}
+
+// ==================================================
+// === Alarm ISR: Direct Digital Synthesis (50 kHz)
 // ==================================================
 static void alarm_irq(void) {
-    // Assert timing GPIO
+    // Assert timing GPIO (to measure ISR execution time with oscilloscope)
     gpio_put(ISR_GPIO, 1);
 
     // Clear alarm interrupt
     hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM);
 
-    // Reset alarm register
+    // Re-arm alarm register for DELAY microseconds (20 us -> 50 kHz)
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
     if (play_tone) {
@@ -254,7 +406,7 @@ static void alarm_irq(void) {
         phase_accum_main += phase_incr_main;
         DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main >> 24] + 2048) & 0xffff));
     } else {
-        // Silence: hold phase at 0 and output midscale 2048 
+        // Silence: hold phase at 0 and output midscale 2048 (0V AC)
         phase_accum_main = 0;
         DAC_data = (DAC_config_chan_B | 2048);
     }
@@ -270,30 +422,37 @@ static void alarm_irq(void) {
 // === Main
 // ==================================================
 int main(void) {
-    // Optional overclock to 150 MHz for RP2040 / default RP2350
+    // Overclock to 150 MHz for RP2040 / default for RP2350
     set_sys_clock_khz(150000, true);
 
     // Initialize stdio
     stdio_init_all();
-    printf("\n\rProtothreads RP2040/RP2350 v1.4\n\r");
-    printf("ADC + Keypad DDS Tone Generator\n\r");
-    printf("Press and hold '0' on the keypad to play the sine wave tone.\n\r");
+    printf("\n\r========================================\n\r");
+    printf("Protothreads RP2040/RP2350 v1.4\n\r");
+    printf("Birdsong Synthesizer - Record & Playback\n\r");
+    printf("========================================\n\r");
+    printf("Controls:\n\r");
+    printf("  '0' : Toggle live tone generator ON/OFF\n\r");
+    printf("  '*' : Toggle between PLAY MODE and RECORD MODE\n\r");
+    printf("  '1'-'9' (in Record Mode) : Hold key to record frequency sweeps (up to 10s)\n\r");
+    printf("  '1'-'9' (in Play Mode)   : Press key to play back recorded sound\n\r");
+    printf("========================================\n\r");
 
-    // Initialize ADC
+    // Initialize ADC on GPIO 26
     adc_init();
     adc_gpio_init(ADC_PIN);
     adc_select_input(ADC_MUX);
 
-    // Initialize LED
+    // Initialize onboard LED
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, true);
 
-    // Initialize SPI for DAC
+    // Initialize SPI for DAC (MCP4822 / MCP4802)
     spi_init(SPI_PORT, 20000000);
     spi_set_format(SPI_PORT, 16, 0, 0, 0);
 
-    // Setup ISR-timing GPIO
+    // Setup ISR-timing GPIO (GPIO 2)
     gpio_init(ISR_GPIO);
     gpio_set_dir(ISR_GPIO, GPIO_OUT);
     gpio_put(ISR_GPIO, 0);
@@ -304,39 +463,43 @@ int main(void) {
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
 
-    // Initialize DDS sine table
+    // Initialize DDS sine table (256 entries, amplitude +/- 2047)
     int ii;
     for (ii = 0; ii < sine_table_size; ii++) {
         sin_table[ii] = (int)(2047.0 * sin((double)ii * 6.283185307179586 / (double)sine_table_size));
     }
 
-    // Default DDS frequency (440 Hz) and initial silence
+    // Default DDS values
     phase_accum_main = 0;
     phase_incr_main = (unsigned int)((440.0 * two32) / Fs);
     play_tone = false;
 
-    // Initialize Keypad GPIOs
+    // Clear all sound recordings
+    for (ii = 0; ii < NUM_RECORD_KEYS; ii++) {
+        recordings[ii].count = 0;
+    }
+
+    // Initialize Keypad GPIOs (pins 9-15)
     gpio_init_mask((0x7F << BASE_KEYPAD_PIN));
-    // Columns as inputs
+    // Columns (GPIO 13, 14, 15) as inputs with pull-ups
     gpio_set_dir((BASE_KEYPAD_PIN + 4), GPIO_IN);
     gpio_set_dir((BASE_KEYPAD_PIN + 5), GPIO_IN);
     gpio_set_dir((BASE_KEYPAD_PIN + 6), GPIO_IN);
-    // Rows as outputs
-    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN));
-    // Set all rows high initially
-    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0xF << BASE_KEYPAD_PIN));
-    // Enable pullup resistors for columns
     gpio_pull_up((BASE_KEYPAD_PIN + 4));
     gpio_pull_up((BASE_KEYPAD_PIN + 5));
     gpio_pull_up((BASE_KEYPAD_PIN + 6));
 
-    // Enable hardware timer alarm interrupt (Alarm 0)
+    // Rows (GPIO 9, 10, 11, 12) as outputs, initially set high
+    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN));
+    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0xF << BASE_KEYPAD_PIN));
+
+    // Enable hardware timer alarm interrupt (Alarm 0 @ 50 kHz)
     hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
     irq_set_exclusive_handler(ALARM_IRQ, alarm_irq);
     irq_set_enabled(ALARM_IRQ, true);
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
-    // Register Protothreads
+    // Register Protothreads (only 2 threads on Core 0)
     pt_add_thread(protothread_adc);
     pt_add_thread(protothread_keypad);
 
