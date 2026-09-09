@@ -77,7 +77,7 @@ volatile int sin_table[sine_table_size];
 #define RECORD_SECONDS      10
 #define RECORD_RATE_HZ      100
 #define MAX_RECORD_SAMPLES  (RECORD_SECONDS * RECORD_RATE_HZ) // 1,000 samples = 10 seconds
-#define NUM_RECORD_KEYS     10                                // Keys 0..9 (1..9 used for sounds)
+#define NUM_RECORD_KEYS     9                                // Keys 0..9 (1..9 used for sounds)
 
 typedef enum {
     MODE_PLAY = 0,
@@ -216,12 +216,8 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                                 playback_key = possible;
                                 playback_idx = 0;
                                 is_playing = true;
-                                printf("[PLAY] Playing Key %d (%d samples, %.2f s)...\n",
-                                       playback_key, recordings[playback_key].count,
-                                       (float)recordings[playback_key].count / (float)RECORD_RATE_HZ);
-                            } else {
-                                printf("[PLAY] Key %d is empty! (Press '*' to enter Record Mode)\n", possible);
-                            }
+                            } 
+
                         } else if (possible == 0) {
                             // Pressing '0' toggles live potentiometer tone generator ON/OFF
                             live_tone_on = !live_tone_on;
@@ -256,8 +252,6 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                         // Stop any ongoing recording or playback when switching modes
                         if (is_recording && recording_key >= 1 && recording_key <= 9) {
                             is_recording = false;
-                            printf("[RECORD] Key %d recording ended due to mode switch (%d samples).\n",
-                                   recording_key, recordings[recording_key].count);
                             recording_key = -1;
                         }
                         is_playing = false;
@@ -427,16 +421,6 @@ int main(void) {
 
     // Initialize stdio
     stdio_init_all();
-    printf("\n\r========================================\n\r");
-    printf("Protothreads RP2040/RP2350 v1.4\n\r");
-    printf("Birdsong Synthesizer - Record & Playback\n\r");
-    printf("========================================\n\r");
-    printf("Controls:\n\r");
-    printf("  '0' : Toggle live tone generator ON/OFF\n\r");
-    printf("  '*' : Toggle between PLAY MODE and RECORD MODE\n\r");
-    printf("  '1'-'9' (in Record Mode) : Hold key to record frequency sweeps (up to 10s)\n\r");
-    printf("  '1'-'9' (in Play Mode)   : Press key to play back recorded sound\n\r");
-    printf("========================================\n\r");
 
     // Initialize ADC on GPIO 26
     adc_init();
