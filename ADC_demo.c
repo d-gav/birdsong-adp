@@ -90,7 +90,7 @@ typedef enum {
 } volume_mode_t;
 
 volatile volume_mode_t current_volume_mode = VOLUME_CONTROL_OFF;
-volatile uint16_t volume_value = 1;
+volatile uint16_t volume_value = 4095;
 
 
 typedef enum {
@@ -209,8 +209,11 @@ static PT_THREAD (protothread_volume_switch(struct pt *pt))
     while(1) {
         if (gpio_get(VOLUME_SWITCH_GPIO) == 1) {
             current_volume_mode = VOLUME_CONTROL_ON;
+            gpio_put(LED_PIN, 1);
         } else {
             current_volume_mode = VOLUME_CONTROL_OFF;
+            volume_value = 4095;
+            gpio_put(LED_PIN, 0);
         }
         PT_YIELD_usec(10000);
     }
@@ -400,21 +403,27 @@ static PT_THREAD (protothread_adc(struct pt *pt))
     PT_BEGIN(pt);
 
     static unsigned int adc_val;
-    static uint16_t current_freq;
+    static uint16_t current_freq = 440;
     static int tick_counter = 0;
 
     while(1) {
+        // Continuous volume control: when switch is ON, pot dynamically controls volume across all modes
+        if (current_volume_mode == VOLUME_CONTROL_ON) {
+            volume_value = (uint16_t)adc_read();
+        } else {
+            volume_value = 4095;
+        }
+
         // --- 1. RECORDING AT 100 Hz ---
         if (is_recording && recording_key >= 1 && recording_key <= 9) {
-            adc_val = adc_read();
-            // Scale 12-bit ADC (0-4095) to 0-10,000 Hz range
             if (current_volume_mode == VOLUME_CONTROL_OFF) {
+                adc_val = adc_read();
+                // Scale 12-bit ADC (0-4095) to 0-5,000 Hz range
                 current_freq = (uint16_t)((adc_val * 5000UL) / 4095UL);
-                volume_value = 1;
-            } else {
-                volume_value = (uint16_t)(adc_val / 2048); 
+                if (current_freq < 100) current_freq = 100; // Minimum audible threshold
+            } else if (current_freq < 100) {
+                current_freq = 440;
             }
-            if (current_freq < 100) current_freq = 100; // Minimum audible threshold
 
             // Store frequency into key buffer if space remains
             if (recordings[recording_key].count < MAX_RECORD_SAMPLES) {
@@ -485,9 +494,13 @@ static PT_THREAD (protothread_adc(struct pt *pt))
 
         // --- 4. LIVE TONE GENERATOR (Key 0 toggle) ---
         else if (live_tone_on) {
-            adc_val = adc_read();
-            current_freq = (uint16_t)((adc_val * 5000UL) / 4095UL);
-            if (current_freq < 100) current_freq = 100;
+            if (current_volume_mode == VOLUME_CONTROL_OFF) {
+                adc_val = adc_read();
+                current_freq = (uint16_t)((adc_val * 5000UL) / 4095UL);
+                if (current_freq < 100) current_freq = 100;
+            } else if (current_freq < 100) {
+                current_freq = 440;
+            }
             phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
             play_tone = true;
         }
@@ -497,11 +510,11 @@ static PT_THREAD (protothread_adc(struct pt *pt))
             play_tone = false;
         }
 
-        // Heartbeat LED toggle every 500 ms (50 ticks @ 10 ms)
-        if (++tick_counter >= 50) {
-            tick_counter = 0;
-            gpio_put(LED_PIN, !gpio_get(LED_PIN));
-        }
+    //    // Heartbeat LED toggle every 500 ms (50 ticks @ 10 ms)
+    //    if (++tick_counter >= 50) {
+    //        tick_counter = 0;
+    //        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+    //    }
 
         // Yield for 10 ms -> Exactly 100 Hz sample rate
         PT_YIELD_usec(10000);
@@ -526,7 +539,9 @@ static void alarm_irq(void) {
     if (play_tone) {
         // DDS phase accumulation and sine table lookup
         phase_accum_main += phase_incr_main;
-        DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main >> 24] + 2048) & 0xffff)) * volume_value;
+        int raw_sine = sin_table[phase_accum_main >> 24]; // -2047 to +2047
+        int sample = (raw_sine * (int)volume_value) / 4095;
+        DAC_data = DAC_config_chan_B | ((sample + 2048) & 0x0FFF);
     } else {
         // Silence: hold phase at 0 and output midscale 2048 (0V AC)
         phase_accum_main = 0;
@@ -579,6 +594,7 @@ int main(void) {
     // Initialize Volume Switch GPIO (0 for off, 1 for on)
     gpio_init(VOLUME_SWITCH_GPIO);
     gpio_set_dir(VOLUME_SWITCH_GPIO, GPIO_IN);
+    gpio_pull_down(VOLUME_SWITCH_GPIO);
 
     // Initialize DDS sine table (256 entries, amplitude +/- 2047)
     int ii;
@@ -620,6 +636,7 @@ int main(void) {
     // Register Protothreads (only 2 threads on Core 0)
     pt_add_thread(protothread_adc);
     pt_add_thread(protothread_keypad);
+    pt_add_thread(protothread_volume_switch);
 
     // Start Protothreads scheduler
     pt_schedule_start;

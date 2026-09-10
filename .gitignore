@@ -1,2 +1,58 @@
-build
+# Build directories and outputs
+build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Compiled object files and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.d
+
+# Firmware binaries and outputs
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.dis
+
+# Editor and temporary files
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+*.rej
+*.log
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# IDE files
+.vs/
+.idea/
+*.suo
+*.user
+
+# Preserve tracked VS Code configurations
 !.vscode/*
+.vscode/.browse.c_cpp.db*
+.vscode/*.log
