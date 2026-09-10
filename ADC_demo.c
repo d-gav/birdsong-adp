@@ -283,6 +283,9 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                                recording_key, recordings[recording_key].count,
                                (float)recordings[recording_key].count / (float)RECORD_RATE_HZ);
                         recording_key = -1;
+
+                        // Recording is done, so drop straight back into Play Mode. 
+                        current_mode = MODE_PLAY;
                     }
 
                     possible = -1;
