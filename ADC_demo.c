@@ -10,6 +10,8 @@
  * - Releasing the button stops recording and saves the frequency sequence (up to 10 seconds).
  * - Pressing/releasing the asterisk '*' button returns to "Play Mode".
  * - In "Play Mode", pressing/releasing that key plays back the recorded frequency sequence at 100 Hz.
+ * - Pressing '#' puts the device into Compose Mode (recording keystrokes).
+ * - Pressing '#' again puts the device into Playback Mode (playing keystroke sequence).
  * - Storing frequencies (uint16_t in Hz), not raw waveforms, at 100 Hz.
  * - Only 2 protothreads on Core 0:
  *     1) protothread_keypad: Keypad scanning, debouncing, mode toggling, button events.
@@ -77,11 +79,14 @@ volatile int sin_table[sine_table_size];
 #define RECORD_SECONDS      10
 #define RECORD_RATE_HZ      100
 #define MAX_RECORD_SAMPLES  (RECORD_SECONDS * RECORD_RATE_HZ) // 1,000 samples = 10 seconds
-#define NUM_RECORD_KEYS     9                                // Keys 0..9 (1..9 used for sounds)
+#define MAX_RECORD_KEYSTROKES 128
+#define NUM_RECORD_KEYS     10                               // Keys 0..9 (1..9 used for sounds)
 
 typedef enum {
-    MODE_PLAY = 0,
-    MODE_RECORD
+    MODE_PLAY,
+    MODE_RECORD,
+    MODE_COMPOSE,
+    MODE_PLAYBACK
 } system_mode_t;
 
 typedef struct {
@@ -89,8 +94,17 @@ typedef struct {
     uint16_t count;                    // Number of recorded samples
 } sound_recording_t;
 
+
+typedef struct {
+    uint16_t keystrokes[MAX_RECORD_KEYSTROKES]; 
+    uint16_t count;                    
+} keystroke_recording_t;
+
 // Frequency recordings for keys 1 through 9
 sound_recording_t recordings[NUM_RECORD_KEYS];
+
+// Keystroke recordings for all keys
+keystroke_recording_t keystrokes; 
 
 // System mode and state flags
 volatile system_mode_t current_mode = MODE_PLAY;
@@ -102,6 +116,8 @@ volatile int  recording_key = -1;
 volatile bool is_playing = false;         // Active while playing back a recorded sequence
 volatile int  playback_key = -1;
 volatile uint16_t playback_idx = 0;
+volatile uint16_t global_key_idx = 0;     // Current keystroke index during sequence playback
+
 
 // ==================================================
 // === Keypad Configuration
@@ -208,7 +224,7 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                             is_recording = true;
                             printf("[RECORD] Key %d recording started (hold down to record, release to finish)...\n", recording_key);
                         }
-                    } else {
+                    } else if (current_mode == MODE_PLAY) {
                         // In Play Mode
                         if (possible >= 1 && possible <= 9) {
                             // Pressing key 1-9 triggers playback of stored frequency sequence
@@ -226,6 +242,10 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                             }
                             printf("[LIVE] Live tone generator %s\n", live_tone_on ? "ON" : "OFF");
                         }
+                    } else if (current_mode == MODE_COMPOSE) {
+                        // In Compose Mode: keystroke recording will be handled here
+                    } else if (current_mode == MODE_PLAYBACK) {
+                        // In Playback Mode: keystroke sequence playback
                     }
                 } else {
                     state = STATE_NOT_PRESSED;
@@ -247,7 +267,7 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                     // --- BUTTON RELEASE EVENT CONFIRMED ---
                     int released_key = possible;
 
-                    // Asterisk key ('*', index 10): Toggle Record / Play Mode
+                    // Asterisk key ('*', index 10): Return to Play Mode or Toggle Record Mode
                     if (released_key == 10) {
                         // Stop any ongoing recording or playback when switching modes
                         if (is_recording && recording_key >= 1 && recording_key <= 9) {
@@ -258,8 +278,10 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                         if (!live_tone_on) {
                             play_tone = false;
                         }
+                        global_key_idx = 0;
+                        playback_idx = 0;
 
-                        // Toggle mode
+                        // Toggle mode (if in COMPOSE or PLAYBACK, returns to PLAY)
                         current_mode = (current_mode == MODE_PLAY) ? MODE_RECORD : MODE_PLAY;
                         printf("\n========================================\n");
                         if (current_mode == MODE_RECORD) {
@@ -270,8 +292,41 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                             printf(">>> MODE: PLAY MODE <<<\n");
                             printf("Press any key 1-9 to play back recorded sounds.\n");
                             printf("Press '0' to toggle live tone.\n");
+                            printf("Press '#' to enter Compose Mode.\n");
                         }
                         printf("========================================\n\n");
+                    }
+                    // Hash key ('#', index 11): Transition into Compose Mode or Playback Mode
+                    else if (released_key == 11) {
+                        // Stop any ongoing recording or playback when switching modes
+                        if (is_recording && recording_key >= 1 && recording_key <= 9) {
+                            is_recording = false;
+                            recording_key = -1;
+                        }
+                        is_playing = false;
+                        if (!live_tone_on) {
+                            play_tone = false;
+                        }
+                        global_key_idx = 0;
+                        playback_idx = 0;
+
+                        if (current_mode == MODE_COMPOSE) {
+                            current_mode = MODE_PLAYBACK;
+                            printf("\n========================================\n");
+                            printf(">>> MODE: PLAYBACK MODE <<<\n");
+                            printf("Playing back keystroke sequence (%d keystrokes)...\n", keystrokes.count);
+                            printf("Press '#' to return to Compose Mode.\n");
+                            printf("Press '*' to return to Play Mode.\n");
+                            printf("========================================\n\n");
+                        } else {
+                            current_mode = MODE_COMPOSE;
+                            printf("\n========================================\n");
+                            printf(">>> MODE: COMPOSE MODE <<<\n");
+                            printf("Record keystroke sequence.\n");
+                            printf("Press '#' again to enter Playback Mode.\n");
+                            printf("Press '*' to return to Play Mode.\n");
+                            printf("========================================\n\n");
+                        }
                     }
                     // Releasing a key 1-9 in Record Mode stops recording
                     else if (current_mode == MODE_RECORD && is_recording && released_key == recording_key) {
@@ -358,7 +413,40 @@ static PT_THREAD (protothread_adc(struct pt *pt))
             }
         }
 
-        // --- 3. LIVE TONE GENERATOR (Key 0 toggle) ---
+        // --- 3. KEYSTROKE SEQUENCE PLAYBACK AT 100 Hz (Playback Mode) ---
+        else if (current_mode == MODE_PLAYBACK) {
+            // Check global key index and that key's playback index; advance if key is finished
+            while (global_key_idx < keystrokes.count) {
+                uint16_t curr_key = keystrokes.keystrokes[global_key_idx];
+                if (curr_key >= 1 && curr_key <= 9 && playback_idx < recordings[curr_key].count) {
+                    // Valid key and valid sample index found
+                    break;
+                }
+                // Key has finished playing or has no samples, advance to next keystroke
+                playback_idx = 0;
+                global_key_idx++;
+            }
+
+            // If still within keystroke sequence, play the current sample
+            if (global_key_idx < keystrokes.count) {
+                uint16_t curr_key = keystrokes.keystrokes[global_key_idx];
+                current_freq = recordings[curr_key].freq[playback_idx++];
+                phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
+                play_tone = true;
+            } else {
+                // Entire keystroke sequence playback finished
+                if (!live_tone_on) {
+                    play_tone = false;
+                }
+                printf("[PLAYBACK] Keystroke sequence complete (%d keystrokes played).\n", keystrokes.count);
+                global_key_idx = 0;
+                playback_idx = 0;
+                current_mode = MODE_PLAY;
+                printf(">>> MODE: PLAY MODE <<<\n\n");
+            }
+        }
+
+        // --- 4. LIVE TONE GENERATOR (Key 0 toggle) ---
         else if (live_tone_on) {
             adc_val = adc_read();
             current_freq = (uint16_t)((adc_val * 10000UL) / 4095UL);
@@ -465,6 +553,7 @@ int main(void) {
     for (ii = 0; ii < NUM_RECORD_KEYS; ii++) {
         recordings[ii].count = 0;
     }
+    keystrokes.count = 0;
 
     // Initialize Keypad GPIOs (pins 9-15)
     gpio_init_mask((0x7F << BASE_KEYPAD_PIN));
