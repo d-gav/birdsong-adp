@@ -66,6 +66,8 @@ uint16_t DAC_data;
 #define PIN_MOSI        7
 #define SPI_PORT        spi0
 
+#define VOLUME_SWITCH_GPIO 16
+
 // GPIO for timing the ISR (measured with oscilloscope)
 #define ISR_GPIO        2
 
@@ -81,6 +83,15 @@ volatile int sin_table[sine_table_size];
 #define MAX_RECORD_SAMPLES  (RECORD_SECONDS * RECORD_RATE_HZ) // 1,000 samples = 10 seconds
 #define MAX_RECORD_KEYSTROKES 128
 #define NUM_RECORD_KEYS     10                               // Keys 0..9 (1..9 used for sounds)
+
+typedef enum {
+    VOLUME_CONTROL_OFF,
+    VOLUME_CONTROL_ON,
+} volume_mode_t;
+
+volatile volume_mode_t current_volume_mode = VOLUME_CONTROL_OFF;
+volatile uint16_t volume_value = 1;
+
 
 typedef enum {
     MODE_PLAY,
@@ -188,6 +199,25 @@ static int scan_keypad(void) {
     return -1; // No key pressed
 }
 
+//
+// Thread 1: Volume Switch 
+//
+static PT_THREAD (protothread_volume_switch(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1) {
+        if (gpio_get(VOLUME_SWITCH_GPIO) == 1) {
+            current_volume_mode = VOLUME_CONTROL_ON;
+        } else {
+            current_volume_mode = VOLUME_CONTROL_OFF;
+        }
+        PT_YIELD_usec(10000);
+    }
+    PT_END(pt);
+}
+
+
 // ==================================================
 // === Thread 1: Keypad Protothread
 // ==================================================
@@ -243,9 +273,7 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                             printf("[LIVE] Live tone generator %s\n", live_tone_on ? "ON" : "OFF");
                         }
                     } else if (current_mode == MODE_COMPOSE) {
-                        // In Compose Mode: keystroke recording will be handled here
                     } else if (current_mode == MODE_PLAYBACK) {
-                        // In Playback Mode: keystroke sequence playback
                     }
                 } else {
                     state = STATE_NOT_PRESSED;
@@ -343,6 +371,10 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
                         current_mode = MODE_PLAY;
                     }
 
+                    else if (current_mode == MODE_COMPOSE) {
+                        keystrokes.keystrokes[keystrokes.count++] = released_key;
+                    } 
+
                     possible = -1;
                 }
                 break;
@@ -376,12 +408,17 @@ static PT_THREAD (protothread_adc(struct pt *pt))
         if (is_recording && recording_key >= 1 && recording_key <= 9) {
             adc_val = adc_read();
             // Scale 12-bit ADC (0-4095) to 0-10,000 Hz range
-            current_freq = (uint16_t)((adc_val * 10000UL) / 4095UL);
+            if (current_volume_mode == VOLUME_CONTROL_OFF) {
+                current_freq = (uint16_t)((adc_val * 5000UL) / 4095UL);
+                volume_value = 1;
+            } else {
+                volume_value = (uint16_t)(adc_val / 2048); 
+            }
             if (current_freq < 100) current_freq = 100; // Minimum audible threshold
 
             // Store frequency into key buffer if space remains
             if (recordings[recording_key].count < MAX_RECORD_SAMPLES) {
-                recordings[recording_key].freq[recordings[recording_key].count++] = current_freq;
+                recordings[recording_key].freq[recordings[recording_key].count++] = current_freq * 8;
             } else {
                 // Buffer full warning (10 seconds reached)
                 static bool warned = false;
@@ -449,7 +486,7 @@ static PT_THREAD (protothread_adc(struct pt *pt))
         // --- 4. LIVE TONE GENERATOR (Key 0 toggle) ---
         else if (live_tone_on) {
             adc_val = adc_read();
-            current_freq = (uint16_t)((adc_val * 10000UL) / 4095UL);
+            current_freq = (uint16_t)((adc_val * 5000UL) / 4095UL);
             if (current_freq < 100) current_freq = 100;
             phase_incr_main = (unsigned int)((current_freq * two32) / Fs);
             play_tone = true;
@@ -489,7 +526,7 @@ static void alarm_irq(void) {
     if (play_tone) {
         // DDS phase accumulation and sine table lookup
         phase_accum_main += phase_incr_main;
-        DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main >> 24] + 2048) & 0xffff));
+        DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main >> 24] + 2048) & 0xffff)) * volume_value;
     } else {
         // Silence: hold phase at 0 and output midscale 2048 (0V AC)
         phase_accum_main = 0;
@@ -537,6 +574,11 @@ int main(void) {
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
+
+
+    // Initialize Volume Switch GPIO (0 for off, 1 for on)
+    gpio_init(VOLUME_SWITCH_GPIO);
+    gpio_set_dir(VOLUME_SWITCH_GPIO, GPIO_IN);
 
     // Initialize DDS sine table (256 entries, amplitude +/- 2047)
     int ii;
